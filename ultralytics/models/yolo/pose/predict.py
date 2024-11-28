@@ -32,7 +32,7 @@ class PosePredictor(DetectionPredictor):
 
     def postprocess(self, preds, img, orig_imgs):
         """Return detection results for a given input image or list of images."""
-        preds = ops.non_max_suppression(
+        preds = ops.hy_non_max_suppression(
             preds,
             self.args.conf,
             self.args.iou,
@@ -48,9 +48,9 @@ class PosePredictor(DetectionPredictor):
         results = []
         for pred, orig_img, img_path in zip(preds, orig_imgs, self.batch[0]):
             pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape).round()
-            pred_kpts = pred[:, 6:].view(len(pred), *self.model.kpt_shape) if len(pred) else pred[:, 6:]
+            pred_kpts = pred[:, 8:].view(len(pred), *self.model.kpt_shape) if len(pred) else pred[:, 8:]
             pred_kpts = ops.scale_coords(img.shape[2:], pred_kpts, orig_img.shape)
             results.append(
-                Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6], keypoints=pred_kpts)
+                Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6], keypoints=pred_kpts, zitai=pred[:, 6:7], mohu=pred[:, 7:8])
             )
         return results

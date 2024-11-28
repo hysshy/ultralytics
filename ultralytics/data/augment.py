@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
+from torch.onnx.symbolic_opset9 import contiguous
 
 from ultralytics.data.utils import polygons2masks, polygons2masks_overlap
 from ultralytics.utils import LOGGER, colorstr
@@ -365,6 +366,14 @@ class BaseMixTransform:
         self.dataset = dataset
         self.pre_transform = pre_transform
         self.p = p
+        #####################hy修改############################################
+        #按照数据集子目录划分id，用于混合、mosaic数据集
+        self.data_id_dict = {}
+        for i, fileName in enumerate(self.dataset.im_files):
+            subname = fileName.split('/')[-2]
+            if subname not in self.data_id_dict:
+                self.data_id_dict[subname] = []
+            self.data_id_dict[subname].append(i)
 
     def __call__(self, labels):
         """
@@ -387,7 +396,9 @@ class BaseMixTransform:
             return labels
 
         # Get index of one or three other images
-        indexes = self.get_indexes()
+        #####################hy修改########################
+        subname = labels['im_file'].split('/')[-2]
+        indexes = self.get_indexes(buffer=False, subname=subname)
         if isinstance(indexes, int):
             indexes = [indexes]
 
@@ -541,7 +552,7 @@ class Mosaic(BaseMixTransform):
         self.border = (-imgsz // 2, -imgsz // 2)  # width, height
         self.n = n
 
-    def get_indexes(self, buffer=True):
+    def get_indexes(self, buffer=True, subname=None):
         """
         Returns a list of random indexes from the dataset for mosaic augmentation.
 
@@ -564,7 +575,10 @@ class Mosaic(BaseMixTransform):
         if buffer:  # select images from buffer
             return random.choices(list(self.dataset.buffer), k=self.n - 1)
         else:  # select any images
-            return [random.randint(0, len(self.dataset) - 1) for _ in range(self.n - 1)]
+            ##########################hy修改###########################################
+            datalist = self.data_id_dict[subname]
+            return random.sample(datalist, self.n - 1)
+            # return [random.randint(0, len(self.dataset) - 1) for _ in range(self.n - 1)]
 
     def _mix_transform(self, labels):
         """
@@ -841,10 +855,14 @@ class Mosaic(BaseMixTransform):
         if len(mosaic_labels) == 0:
             return {}
         cls = []
+        zitai = []
+        mohu = []
         instances = []
         imgsz = self.imgsz * 2  # mosaic imgsz
         for labels in mosaic_labels:
             cls.append(labels["cls"])
+            zitai.append(labels["zitai"])
+            mohu.append(labels["mohu"])
             instances.append(labels["instances"])
         # Final labels
         final_labels = {
@@ -852,12 +870,16 @@ class Mosaic(BaseMixTransform):
             "ori_shape": mosaic_labels[0]["ori_shape"],
             "resized_shape": (imgsz, imgsz),
             "cls": np.concatenate(cls, 0),
+            "zitai": np.concatenate(zitai, 0),
+            "mohu": np.concatenate(mohu, 0),
             "instances": Instances.concatenate(instances, axis=0),
             "mosaic_border": self.border,
         }
         final_labels["instances"].clip(imgsz, imgsz)
         good = final_labels["instances"].remove_zero_area_boxes()
         final_labels["cls"] = final_labels["cls"][good]
+        final_labels["zitai"] = final_labels["zitai"][good]
+        final_labels["mohu"] = final_labels["mohu"][good]
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
         return final_labels
@@ -1038,6 +1060,7 @@ class RandomPerspective:
             >>> transformed_img, matrix, scale = affine_transform(img, border)
         """
         # Center
+
         C = np.eye(3, dtype=np.float32)
 
         C[0, 2] = -img.shape[1] / 2  # x translation (pixels)
@@ -1216,12 +1239,15 @@ class RandomPerspective:
             >>> result = transform(labels)
             >>> assert result["img"].shape[:2] == result["resized_shape"]
         """
+
         if self.pre_transform and "mosaic_border" not in labels:
             labels = self.pre_transform(labels)
         labels.pop("ratio_pad", None)  # do not need ratio pad
 
         img = labels["img"]
         cls = labels["cls"]
+        zitai = labels["zitai"]
+        mohu = labels["mohu"]
         instances = labels.pop("instances")
         # Make sure the coord formats are right
         instances.convert_bbox(format="xyxy")
@@ -1255,6 +1281,8 @@ class RandomPerspective:
         )
         labels["instances"] = new_instances[i]
         labels["cls"] = cls[i]
+        labels["zitai"] = zitai[i]
+        labels["mohu"] = mohu[i]
         labels["img"] = img
         labels["resized_shape"] = img.shape[:2]
         return labels
@@ -1400,7 +1428,7 @@ class RandomFlip:
         >>> flipped_instances = result["instances"]
     """
 
-    def __init__(self, p=0.5, direction="horizontal", flip_idx=None) -> None:
+    def __init__(self, p=0.5, direction="horizontal", flip_idx=None, flip_idx2=None) -> None:
         """
         Initializes the RandomFlip class with probability and direction.
 
@@ -1425,6 +1453,7 @@ class RandomFlip:
         self.p = p
         self.direction = direction
         self.flip_idx = flip_idx
+        self.flip_idx2 = flip_idx2
 
     def __call__(self, labels):
         """
@@ -1467,6 +1496,7 @@ class RandomFlip:
             # For keypoints
             if self.flip_idx is not None and instances.keypoints is not None:
                 instances.keypoints = np.ascontiguousarray(instances.keypoints[:, self.flip_idx, :])
+            labels['zitai'] = self.flip_idx2[labels['zitai'].astype(int)]
         labels["img"] = np.ascontiguousarray(img)
         labels["instances"] = instances
         return labels
@@ -1628,105 +1658,92 @@ class LetterBox:
         return labels
 
 
-class CopyPaste(BaseMixTransform):
+class CopyPaste:
     """
-    CopyPaste class for applying Copy-Paste augmentation to image datasets.
+    Implements Copy-Paste augmentation as described in https://arxiv.org/abs/2012.07177.
 
-    This class implements the Copy-Paste augmentation technique as described in the paper "Simple Copy-Paste is a Strong
-    Data Augmentation Method for Instance Segmentation" (https://arxiv.org/abs/2012.07177). It combines objects from
-    different images to create new training samples.
+    This class applies Copy-Paste augmentation on images and their corresponding instances.
 
     Attributes:
-        dataset (Any): The dataset to which Copy-Paste augmentation will be applied.
-        pre_transform (Callable | None): Optional transform to apply before Copy-Paste.
-        p (float): Probability of applying Copy-Paste augmentation.
+        p (float): Probability of applying the Copy-Paste augmentation. Must be between 0 and 1.
 
     Methods:
-        get_indexes: Returns a random index from the dataset.
-        _mix_transform: Applies Copy-Paste augmentation to the input labels.
-        __call__: Applies the Copy-Paste transformation to images and annotations.
+        __call__: Applies Copy-Paste augmentation to given image and instances.
 
     Examples:
-        >>> from ultralytics.data.augment import CopyPaste
-        >>> dataset = YourDataset(...)  # Your image dataset
-        >>> copypaste = CopyPaste(dataset, p=0.5)
-        >>> augmented_labels = copypaste(original_labels)
+        >>> copypaste = CopyPaste(p=0.5)
+        >>> augmented_labels = copypaste(labels)
+        >>> augmented_image = augmented_labels["img"]
     """
 
-    def __init__(self, dataset=None, pre_transform=None, p=0.5, mode="flip") -> None:
-        """Initializes CopyPaste object with dataset, pre_transform, and probability of applying MixUp."""
-        super().__init__(dataset=dataset, pre_transform=pre_transform, p=p)
-        assert mode in {"flip", "mixup"}, f"Expected `mode` to be `flip` or `mixup`, but got {mode}."
-        self.mode = mode
+    def __init__(self, p=0.5) -> None:
+        """
+        Initializes the CopyPaste augmentation object.
 
-    def get_indexes(self):
-        """Returns a list of random indexes from the dataset for CopyPaste augmentation."""
-        return random.randint(0, len(self.dataset) - 1)
+        This class implements the Copy-Paste augmentation as described in the paper "Simple Copy-Paste is a Strong Data
+        Augmentation Method for Instance Segmentation" (https://arxiv.org/abs/2012.07177). It applies the Copy-Paste
+        augmentation on images and their corresponding instances with a given probability.
 
-    def _mix_transform(self, labels):
-        """Applies Copy-Paste augmentation to combine objects from another image into the current image."""
-        labels2 = labels["mix_labels"][0]
-        return self._transform(labels, labels2)
+        Args:
+            p (float): The probability of applying the Copy-Paste augmentation. Must be between 0 and 1.
+
+        Attributes:
+            p (float): Stores the probability of applying the augmentation.
+
+        Examples:
+            >>> augment = CopyPaste(p=0.7)
+            >>> augmented_data = augment(original_data)
+        """
+        self.p = p
 
     def __call__(self, labels):
-        """Applies Copy-Paste augmentation to an image and its labels."""
-        if len(labels["instances"].segments) == 0 or self.p == 0:
-            return labels
-        if self.mode == "flip":
-            return self._transform(labels)
+        """
+        Applies Copy-Paste augmentation to an image and its instances.
 
-        # Get index of one or three other images
-        indexes = self.get_indexes()
-        if isinstance(indexes, int):
-            indexes = [indexes]
+        Args:
+            labels (Dict): A dictionary containing:
+                - 'img' (np.ndarray): The image to augment.
+                - 'cls' (np.ndarray): Class labels for the instances.
+                - 'instances' (ultralytics.engine.results.Instances): Object containing bounding boxes, segments, etc.
 
-        # Get images information will be used for Mosaic or MixUp
-        mix_labels = [self.dataset.get_image_and_label(i) for i in indexes]
+        Returns:
+            (Dict): Dictionary with augmented image and updated instances under 'img', 'cls', and 'instances' keys.
 
-        if self.pre_transform is not None:
-            for i, data in enumerate(mix_labels):
-                mix_labels[i] = self.pre_transform(data)
-        labels["mix_labels"] = mix_labels
-
-        # Update cls and texts
-        labels = self._update_label_text(labels)
-        # Mosaic or MixUp
-        labels = self._mix_transform(labels)
-        labels.pop("mix_labels", None)
-        return labels
-
-    def _transform(self, labels1, labels2={}):
-        """Applies Copy-Paste augmentation to combine objects from another image into the current image."""
-        im = labels1["img"]
-        cls = labels1["cls"]
+        Examples:
+            >>> labels = {"img": np.random.rand(640, 640, 3), "cls": np.array([0, 1, 2]), "instances": Instances(...)}
+            >>> augmenter = CopyPaste(p=0.5)
+            >>> augmented_labels = augmenter(labels)
+        """
+        im = labels["img"]
+        cls = labels["cls"]
         h, w = im.shape[:2]
-        instances = labels1.pop("instances")
+        instances = labels.pop("instances")
         instances.convert_bbox(format="xyxy")
         instances.denormalize(w, h)
+        if self.p and len(instances.segments):
+            _, w, _ = im.shape  # height, width, channels
+            im_new = np.zeros(im.shape, np.uint8)
 
-        im_new = np.zeros(im.shape, np.uint8)
-        instances2 = labels2.pop("instances", None)
-        if instances2 is None:
-            instances2 = deepcopy(instances)
-            instances2.fliplr(w)
-        ioa = bbox_ioa(instances2.bboxes, instances.bboxes)  # intersection over area, (N, M)
-        indexes = np.nonzero((ioa < 0.30).all(1))[0]  # (N, )
-        n = len(indexes)
-        sorted_idx = np.argsort(ioa.max(1)[indexes])
-        indexes = indexes[sorted_idx]
-        for j in indexes[: round(self.p * n)]:
-            cls = np.concatenate((cls, labels2.get("cls", cls)[[j]]), axis=0)
-            instances = Instances.concatenate((instances, instances2[[j]]), axis=0)
-            cv2.drawContours(im_new, instances2.segments[[j]].astype(np.int32), -1, (1, 1, 1), cv2.FILLED)
+            # Calculate ioa first then select indexes randomly
+            ins_flip = deepcopy(instances)
+            ins_flip.fliplr(w)
 
-        result = labels2.get("img", cv2.flip(im, 1))  # augment segments
-        i = im_new.astype(bool)
-        im[i] = result[i]
+            ioa = bbox_ioa(ins_flip.bboxes, instances.bboxes)  # intersection over area, (N, M)
+            indexes = np.nonzero((ioa < 0.30).all(1))[0]  # (N, )
+            n = len(indexes)
+            for j in random.sample(list(indexes), k=round(self.p * n)):
+                cls = np.concatenate((cls, cls[[j]]), axis=0)
+                instances = Instances.concatenate((instances, ins_flip[[j]]), axis=0)
+                cv2.drawContours(im_new, instances.segments[[j]].astype(np.int32), -1, (1, 1, 1), cv2.FILLED)
 
-        labels1["img"] = im
-        labels1["cls"] = cls
-        labels1["instances"] = instances
-        return labels1
+            result = cv2.flip(im, 1)  # augment segments (flip left-right)
+            i = cv2.flip(im_new, 1).astype(bool)
+            im[i] = result[i]
+
+        labels["img"] = im
+        labels["cls"] = cls
+        labels["instances"] = instances
+        return labels
 
 
 class Albumentations:
@@ -2034,6 +2051,8 @@ class Format:
         img = labels.pop("img")
         h, w = img.shape[:2]
         cls = labels.pop("cls")
+        zitai = labels.pop("zitai")
+        mohu = labels.pop("mohu")
         instances = labels.pop("instances")
         instances.convert_bbox(format=self.bbox_format)
         instances.denormalize(w, h)
@@ -2050,6 +2069,8 @@ class Format:
             labels["masks"] = masks
         labels["img"] = self._format_img(img)
         labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl)
+        labels["zitai"] = torch.from_numpy(zitai) if nl else torch.zeros(nl)
+        labels["mohu"] = torch.from_numpy(mohu) if nl else torch.zeros(nl)
         labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
         if self.return_keypoint:
             labels["keypoints"] = torch.from_numpy(instances.keypoints)
@@ -2272,15 +2293,15 @@ class RandomLoadText:
 
 def v8_transforms(dataset, imgsz, hyp, stretch=False):
     """
-    Applies a series of image transformations for training.
+    Applies a series of image transformations for YOLOv8 training.
 
-    This function creates a composition of image augmentation techniques to prepare images for YOLO training.
+    This function creates a composition of image augmentation techniques to prepare images for YOLOv8 training.
     It includes operations such as mosaic, copy-paste, random perspective, mixup, and various color adjustments.
 
     Args:
         dataset (Dataset): The dataset object containing image data and annotations.
         imgsz (int): The target image size for resizing.
-        hyp (Namespace): A dictionary of hyperparameters controlling various aspects of the transformations.
+        hyp (Dict): A dictionary of hyperparameters controlling various aspects of the transformations.
         stretch (bool): If True, applies stretching to the image. If False, uses LetterBox resizing.
 
     Returns:
@@ -2288,35 +2309,29 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
 
     Examples:
         >>> from ultralytics.data.dataset import YOLODataset
-        >>> from ultralytics.utils import IterableSimpleNamespace
         >>> dataset = YOLODataset(img_path="path/to/images", imgsz=640)
-        >>> hyp = IterableSimpleNamespace(mosaic=1.0, copy_paste=0.5, degrees=10.0, translate=0.2, scale=0.9)
+        >>> hyp = {"mosaic": 1.0, "copy_paste": 0.5, "degrees": 10.0, "translate": 0.2, "scale": 0.9}
         >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
         >>> augmented_data = transforms(dataset[0])
     """
-    mosaic = Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic)
-    affine = RandomPerspective(
-        degrees=hyp.degrees,
-        translate=hyp.translate,
-        scale=hyp.scale,
-        shear=hyp.shear,
-        perspective=hyp.perspective,
-        pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
+    pre_transform = Compose(
+        [
+            Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic),
+            CopyPaste(p=hyp.copy_paste),
+            RandomPerspective(
+                degrees=hyp.degrees,
+                translate=hyp.translate,
+                scale=hyp.scale,
+                shear=hyp.shear,
+                perspective=hyp.perspective,
+                pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
+            ),
+        ]
     )
-
-    pre_transform = Compose([mosaic, affine])
-    if hyp.copy_paste_mode == "flip":
-        pre_transform.insert(1, CopyPaste(p=hyp.copy_paste, mode=hyp.copy_paste_mode))
-    else:
-        pre_transform.append(
-            CopyPaste(
-                dataset,
-                pre_transform=Compose([Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic), affine]),
-                p=hyp.copy_paste,
-                mode=hyp.copy_paste_mode,
-            )
-        )
     flip_idx = dataset.data.get("flip_idx", [])  # for keypoints augmentation
+    flip_idx2 = dataset.data.get("flip_idx2", None)  # for keypoints augmentation
+    if flip_idx2 is not None:
+        flip_idx2 = np.array(flip_idx2)
     if dataset.use_keypoints:
         kpt_shape = dataset.data.get("kpt_shape", None)
         if len(flip_idx) == 0 and hyp.fliplr > 0.0:
@@ -2332,7 +2347,7 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
             Albumentations(p=1.0),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud),
-            RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
+            RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx, flip_idx2=flip_idx2),
         ]
     )  # transforms
 

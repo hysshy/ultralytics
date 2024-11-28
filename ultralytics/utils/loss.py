@@ -87,6 +87,20 @@ class DFLoss(nn.Module):
             + F.cross_entropy(pred_dist, tr.view(-1), reduction="none").view(tl.shape) * wr
         ).mean(-1, keepdim=True)
 
+class L1loss(nn.Module):
+    """Criterion class for computing training losses during training."""
+    def __init__(self):
+        """Initialize the L1loss module."""
+        super().__init__()
+
+    def forward(self, pred_values, target_values, target_scores, target_scores_sum, fg_mask):
+        """L1 loss."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        pred_values = pred_values.sigmoid()
+        pred_values = pred_values[fg_mask]
+        target_values = target_values[fg_mask]
+        loss = (F.l1_loss(pred_values, target_values, reduction='none') * weight).sum() /target_scores_sum
+        return loss
 
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses during training."""
@@ -447,26 +461,35 @@ class v8SegmentationLoss(v8DetectionLoss):
 class v8PoseLoss(v8DetectionLoss):
     """Criterion class for computing training losses."""
 
-    def __init__(self, model):  # model must be de-paralleled
+    def __init__(self, model, cls_num=9, zitai_num=11, mohu_num=1):  # model must be de-paralleled
         """Initializes v8PoseLoss with model, sets keypoint variables and declares a keypoint loss instance."""
         super().__init__(model)
+        self.cls_num = cls_num
+        self.zitai_num = zitai_num
+        self.mohu_num = mohu_num
         self.kpt_shape = model.model[-1].kpt_shape
         self.bce_pose = nn.BCEWithLogitsLoss()
         is_pose = self.kpt_shape == [17, 3]
         nkpt = self.kpt_shape[0]  # number of keypoints
         sigmas = torch.from_numpy(OKS_SIGMA).to(self.device) if is_pose else torch.ones(nkpt, device=self.device) / nkpt
         self.keypoint_loss = KeypointLoss(sigmas=sigmas)
+        self.cls_assigner = TaskAlignedAssigner(topk=10, num_classes=self.cls_num, alpha=0.5, beta=6.0)
+        self.zitai_assigner = TaskAlignedAssigner(topk=10, num_classes=self.zitai_num, alpha=0.5, beta=6.0)
+        self.mohu_assigner = TaskAlignedAssigner(topk=10, num_classes=self.mohu_num, alpha=0.5, beta=6.0, mohu=True)
+        self.mohu_loss = L1loss()
 
-    def __call__(self, preds, batch):
+    def __call__(self, preds, batch, use_zitai=True, use_mohu=True):
         """Calculate the total loss and detach it."""
-        loss = torch.zeros(5, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility
+        loss = torch.zeros(7, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
         )
-
+        pred_scores, zitai_pred_scores, mohu_pred_scores = pred_scores.split((9, 11, 1), 1)
         # B, grids, ..
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        zitai_pred_scores = zitai_pred_scores.permute(0, 2, 1).contiguous()
+        mohu_pred_scores = mohu_pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
         pred_kpts = pred_kpts.permute(0, 2, 1).contiguous()
 
@@ -486,7 +509,7 @@ class v8PoseLoss(v8DetectionLoss):
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
         pred_kpts = self.kpts_decode(anchor_points, pred_kpts.view(batch_size, -1, *self.kpt_shape))  # (b, h*w, 17, 3)
 
-        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.cls_assigner(
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
             anchor_points * stride_tensor,
@@ -494,34 +517,146 @@ class v8PoseLoss(v8DetectionLoss):
             gt_bboxes,
             mask_gt,
         )
-
-        target_scores_sum = max(target_scores.sum(), 1)
-
-        # Cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[3] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
-
+        if use_zitai:
+            zitai_targets = torch.cat((batch_idx, batch["zitai"].view(-1, 1), batch["bboxes"]), 1)
+            zitai_targets = self.preprocess(zitai_targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+            zitai_gt_labels, zitai_gt_bboxes = zitai_targets.split((1, 4), 2)
+            _, zitai_target_bboxes, zitai_target_scores, zitai_fg_mask, zitai_target_gt_idx = self.zitai_assigner(
+                zitai_pred_scores.detach().sigmoid(),
+                (pred_bboxes.detach() * stride_tensor).type(zitai_gt_bboxes.dtype),
+                anchor_points * stride_tensor,
+                zitai_gt_labels,
+                zitai_gt_bboxes,
+                mask_gt,
+            )
+        if use_mohu:
+            mohu_targets = torch.cat((batch_idx, batch["mohu"].view(-1, 1), batch["bboxes"]), 1)
+            mohu_targets = self.preprocess(mohu_targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+            mohu_gt_scores, mohu_gt_bboxes = mohu_targets.split((1, 4), 2)
+            mohu_gt_labels = torch.zeros_like(mohu_gt_scores, dtype=mohu_gt_scores.dtype, device=mohu_gt_scores.device)
+            _, mohu_target_bboxes, mohu_target_scores, target_mohu_values, mohu_fg_mask, mohu_target_gt_idx = self.mohu_assigner(
+                mohu_pred_scores.detach().sigmoid(),
+                (pred_bboxes.detach() * stride_tensor).type(mohu_gt_bboxes.dtype),
+                anchor_points * stride_tensor,
+                mohu_gt_labels,
+                mohu_gt_bboxes,
+                mask_gt,
+                mohu_gt_scores
+            )
         # Bbox loss
         if fg_mask.sum():
             target_bboxes /= stride_tensor
-            loss[0], loss[4] = self.bbox_loss(
-                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
-            )
-            keypoints = batch["keypoints"].to(self.device).float().clone()
-            keypoints[..., 0] *= imgsz[1]
-            keypoints[..., 1] *= imgsz[0]
+            ###############################hy修改############################
+            im_files = batch["im_file"]
+            kp_index = []
+            kp_index2 = []
+            detect_index = []
+            zitai_index = []
+            mohu_index = []
+            for i, im_file in enumerate(im_files):
+                subname = im_file.split("/")[-2]
+                if subname == "detect":
+                    detect_index.append(i)
+                elif subname == "facekp":
+                    kp_index2.append(i)
+                    for j in range(len(batch["batch_idx"])):
+                        if batch["batch_idx"][j].item() == i:
+                            kp_index.append(j)
+                elif subname == "faceZitai":
+                    zitai_index.append(i)
+                elif subname == "mohu":
+                    mohu_index.append(i)
 
-            loss[1], loss[2] = self.calculate_keypoints_loss(
-                fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, target_bboxes, pred_kpts
-            )
+            kp_index = torch.tensor(kp_index)
+            kp_index2 = torch.tensor(kp_index2, device=self.device)
+            detect_index = torch.tensor(detect_index, device=self.device)
+            zitai_index = torch.tensor(zitai_index, device=self.device)
+            mohu_index = torch.tensor(mohu_index, device=self.device)
+
+            if mohu_index.shape[0] == 0:
+                loss[6] = 0
+            else:
+                mohu_target_scores = mohu_target_scores[mohu_index]
+                mohu_fg_mask = mohu_fg_mask[mohu_index]
+                mohu_target_scores_sum = max(mohu_target_scores.sum(), 1)
+                mohu_pred_scores = mohu_pred_scores[mohu_index]
+                target_mohu_values = target_mohu_values[mohu_index]
+                # Cls loss
+                loss[6] = self.mohu_loss(mohu_pred_scores, target_mohu_values, mohu_target_scores,
+                                         mohu_target_scores_sum, mohu_fg_mask)
+
+            if detect_index.shape[0] == 0:
+                loss[0] = 0
+                loss[4] = 0
+            else:
+                pred_distri = pred_distri[detect_index]
+                pred_bboxes = pred_bboxes[detect_index]
+                detect_target_bboxes = target_bboxes[detect_index]
+                detect_target_scores = target_scores[detect_index]
+                detect_fg_mask = fg_mask[detect_index]
+                detect_target_scores_sum = max(detect_target_scores.sum(), 1)
+                pred_scores = pred_scores[detect_index]
+                # target_scores = target_scores.to(dtype)[detect_index]
+                # Cls loss
+                loss[3] = self.bce(pred_scores, detect_target_scores.to(dtype)).sum() / detect_target_scores_sum  # BCE
+                loss[0], loss[4] = self.bbox_loss(
+                    pred_distri, pred_bboxes, anchor_points, detect_target_bboxes, detect_target_scores,
+                    detect_target_scores_sum,
+                    detect_fg_mask
+                )
+            if kp_index2.shape[0] == 0 or kp_index.shape[0] == 0:
+                loss[1] = 0
+                loss[2] = 0
+            else:
+                kp_fg_mask = fg_mask[kp_index2]
+                target_gt_idx = target_gt_idx[kp_index2]
+                batch_idx = batch_idx[kp_index]
+                kp_target_bboxes = target_bboxes[kp_index2]
+                pred_kpts = pred_kpts[kp_index2]
+                keypoints = batch["keypoints"].to(self.device).float().clone()
+                keypoints = keypoints[kp_index]
+                keypoints[..., 0] *= imgsz[1]
+                keypoints[..., 1] *= imgsz[0]
+
+                loss[1], loss[2] = self.calculate_keypoints_loss(
+                    kp_fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, kp_target_bboxes, pred_kpts
+                )
+            if zitai_index.shape[0] == 0:
+                loss[5] = 0
+            else:
+                zitai_target_scores = zitai_target_scores[zitai_index]
+                zitai_target_scores_sum = max(zitai_target_scores.sum(), 1)
+                zitai_pred_scores = zitai_pred_scores[zitai_index]
+                # zitai loss
+                loss[5] = self.bce(zitai_pred_scores,
+                                   zitai_target_scores.to(dtype)).sum() / zitai_target_scores_sum  # BCE
+            ###############################hy修改###############################
+            # keypoints = batch["keypoints"].to(self.device).float().clone()
+            # keypoints[..., 0] *= imgsz[1]
+            # keypoints[..., 1] *= imgsz[0]
+            #
+            # loss[1], loss[2] = self.calculate_keypoints_loss(
+            #     fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, target_bboxes, pred_kpts
+            # )
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.pose  # pose gain
         loss[2] *= self.hyp.kobj  # kobj gain
         loss[3] *= self.hyp.cls  # cls gain
         loss[4] *= self.hyp.dfl  # dfl gain
-
-        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+        loss[5] *= 1.0  # zitai gain
+        loss[6] *= 1.0  # mohu gain
+        prinloss = loss.detach().clone()
+        ###############################hy修改###############################
+        loss[0] *= detect_index.shape[0]  # box gain
+        loss[1] *= kp_index2.shape[0]  # pose gain
+        loss[2] *= kp_index2.shape[0]  # kobj gain
+        loss[3] *= detect_index.shape[0]  # cls gain
+        loss[4] *= detect_index.shape[0]  # dfl gain
+        loss[5] *= zitai_index.shape[0]  # dfl gain
+        loss[6] *= mohu_index.shape[0]  # dfl gain
+        return loss.sum(), prinloss  # loss(box, cls, dfl)
+        ###############################hy修改###############################
 
     @staticmethod
     def kpts_decode(anchor_points, pred_kpts):

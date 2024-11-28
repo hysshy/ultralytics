@@ -26,7 +26,7 @@ class TaskAlignedAssigner(nn.Module):
         eps (float): A small value to prevent division by zero.
     """
 
-    def __init__(self, topk=13, num_classes=80, alpha=1.0, beta=6.0, eps=1e-9):
+    def __init__(self, topk=13, num_classes=80, alpha=1.0, beta=6.0, eps=1e-9, mohu=False):
         """Initialize a TaskAlignedAssigner object with customizable hyperparameters."""
         super().__init__()
         self.topk = topk
@@ -35,9 +35,11 @@ class TaskAlignedAssigner(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.eps = eps
+        self.mohu = mohu
+
 
     @torch.no_grad()
-    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt, mohu_gt_values=None):
         """
         Compute the task-aligned assignment. Reference code is available at
         https://github.com/Nioolek/PPYOLOE_pytorch/blob/master/ppyoloe/assigner/tal_assigner.py.
@@ -71,7 +73,7 @@ class TaskAlignedAssigner(nn.Module):
             )
 
         try:
-            return self._forward(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
+            return self._forward(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt, mohu_gt_values)
         except torch.OutOfMemoryError:
             # Move tensors to CPU, compute, then move back to original device
             LOGGER.warning("WARNING: CUDA OutOfMemoryError in TaskAlignedAssigner, using CPU")
@@ -79,7 +81,7 @@ class TaskAlignedAssigner(nn.Module):
             result = self._forward(*cpu_tensors)
             return tuple(t.to(device) for t in result)
 
-    def _forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+    def _forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt, mohu_gt_values):
         """
         Compute the task-aligned assignment. Reference code is available at
         https://github.com/Nioolek/PPYOLOE_pytorch/blob/master/ppyoloe/assigner/tal_assigner.py.
@@ -106,7 +108,7 @@ class TaskAlignedAssigner(nn.Module):
         target_gt_idx, fg_mask, mask_pos = self.select_highest_overlaps(mask_pos, overlaps, self.n_max_boxes)
 
         # Assigned target
-        target_labels, target_bboxes, target_scores = self.get_targets(gt_labels, gt_bboxes, target_gt_idx, fg_mask)
+        target_labels, target_bboxes, target_scores, target_mohu_values = self.get_targets(gt_labels, gt_bboxes, target_gt_idx, fg_mask, mohu_gt_values)
 
         # Normalize
         align_metric *= mask_pos
@@ -114,7 +116,8 @@ class TaskAlignedAssigner(nn.Module):
         pos_overlaps = (overlaps * mask_pos).amax(dim=-1, keepdim=True)  # b, max_num_obj
         norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
         target_scores = target_scores * norm_align_metric
-
+        if self.mohu:
+            return target_labels, target_bboxes, target_scores, target_mohu_values, fg_mask.bool(), target_gt_idx
         return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
 
     def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
@@ -189,7 +192,7 @@ class TaskAlignedAssigner(nn.Module):
 
         return count_tensor.to(metrics.dtype)
 
-    def get_targets(self, gt_labels, gt_bboxes, target_gt_idx, fg_mask):
+    def get_targets(self, gt_labels, gt_bboxes, target_gt_idx, fg_mask, mohu_gt_values=None):
         """
         Compute target labels, target bounding boxes, and target scores for the positive anchor points.
 
@@ -234,8 +237,10 @@ class TaskAlignedAssigner(nn.Module):
 
         fg_scores_mask = fg_mask[:, :, None].repeat(1, 1, self.num_classes)  # (b, h*w, 80)
         target_scores = torch.where(fg_scores_mask > 0, target_scores, 0)
-
-        return target_labels, target_bboxes, target_scores
+        if mohu_gt_values is not None:
+            target_mohu_values = mohu_gt_values.view(-1, mohu_gt_values.shape[-1])[target_gt_idx]
+            return target_labels, target_bboxes, target_scores, target_mohu_values
+        return target_labels, target_bboxes, target_scores, None
 
     @staticmethod
     def select_candidates_in_gts(xy_centers, gt_bboxes, eps=1e-9):

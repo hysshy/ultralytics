@@ -228,7 +228,7 @@ class Results(SimpleClass):
     """
 
     def __init__(
-        self, orig_img, path, names, boxes=None, masks=None, probs=None, keypoints=None, obb=None, speed=None
+        self, orig_img, path, names, boxes=None, masks=None, probs=None, keypoints=None, zitai=None, mohu=None, obb=None, speed=None
     ) -> None:
         """
         Initialize the Results class for storing and manipulating inference results.
@@ -263,12 +263,14 @@ class Results(SimpleClass):
         self.masks = Masks(masks, self.orig_shape) if masks is not None else None  # native size or imgsz masks
         self.probs = Probs(probs) if probs is not None else None
         self.keypoints = Keypoints(keypoints, self.orig_shape) if keypoints is not None else None
+        self.zitai = zitai
+        self.mohu = mohu
         self.obb = OBB(obb, self.orig_shape) if obb is not None else None
         self.speed = speed if speed is not None else {"preprocess": None, "inference": None, "postprocess": None}
         self.names = names
         self.path = path
         self.save_dir = None
-        self._keys = "boxes", "masks", "probs", "keypoints", "obb"
+        self._keys = "boxes", "masks", "probs", "keypoints", "obb", "zitai"
 
     def __getitem__(self, idx):
         """
@@ -305,7 +307,7 @@ class Results(SimpleClass):
             if v is not None:
                 return len(v)
 
-    def update(self, boxes=None, masks=None, probs=None, obb=None):
+    def update(self, boxes=None, masks=None, probs=None, obb=None, zitai=None, mohu=None):
         """
         Updates the Results object with new detection data.
 
@@ -332,6 +334,10 @@ class Results(SimpleClass):
             self.probs = probs
         if obb is not None:
             self.obb = OBB(obb, self.orig_shape)
+        if zitai is not None:
+            self.zitai = zitai
+        if mohu is not None:
+            self.mohu = mohu
 
     def _apply(self, fn, *args, **kwargs):
         """

@@ -1071,10 +1071,13 @@ class PoseMetrics(SegmentMetrics):
         self.names = names
         self.box = Metric()
         self.pose = Metric()
+        self.zitai = Metric()
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
         self.task = "pose"
 
-    def process(self, tp, tp_p, conf, pred_cls, target_cls):
+    def process(self, tp_p, conf_p, pred_cls_p, target_cls_p,
+                tp, conf, pred_cls, target_cls,
+                tp_zitai, conf_zitai, pred_cls_zitai, target_cls_zitai):
         """
         Processes the detection and pose metrics over the given set of predictions.
 
@@ -1087,16 +1090,16 @@ class PoseMetrics(SegmentMetrics):
         """
         results_pose = ap_per_class(
             tp_p,
-            conf,
-            pred_cls,
-            target_cls,
+            conf_p,
+            pred_cls_p,
+            target_cls_p,
             plot=self.plot,
             on_plot=self.on_plot,
             save_dir=self.save_dir,
             names=self.names,
             prefix="Pose",
         )[2:]
-        self.pose.nc = len(self.names)
+        self.pose.nc = 2
         self.pose.update(results_pose)
         results_box = ap_per_class(
             tp,
@@ -1109,8 +1112,21 @@ class PoseMetrics(SegmentMetrics):
             names=self.names,
             prefix="Box",
         )[2:]
-        self.box.nc = len(self.names)
+        self.box.nc = 9
         self.box.update(results_box)
+        results_zitai = ap_per_class(
+            tp_zitai,
+            conf_zitai,
+            pred_cls_zitai,
+            target_cls_zitai,
+            plot=self.plot,
+            on_plot=self.on_plot,
+            save_dir=self.save_dir,
+            names=self.names,
+            prefix="Box",
+        )[2:]
+        self.zitai.nc = 11
+        self.zitai.update(results_zitai)
 
     @property
     def keys(self):
@@ -1124,11 +1140,15 @@ class PoseMetrics(SegmentMetrics):
             "metrics/recall(P)",
             "metrics/mAP50(P)",
             "metrics/mAP50-95(P)",
+            "metrics/precision(Z)",
+            "metrics/recall(Z)",
+            "metrics/mAP50(Z)",
+            "metrics/mAP50-95(Z)",
         ]
 
     def mean_results(self):
         """Return the mean results of box and pose."""
-        return self.box.mean_results() + self.pose.mean_results()
+        return self.box.mean_results() + self.pose.mean_results() + self.zitai.mean_results()
 
     def class_result(self, i):
         """Return the class-wise detection results for a specific class i."""

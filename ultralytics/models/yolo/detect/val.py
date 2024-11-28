@@ -51,8 +51,9 @@ class DetectionValidator(BaseValidator):
         """Preprocesses batch of images for YOLO training."""
         batch["img"] = batch["img"].to(self.device, non_blocking=True)
         batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 255
-        for k in ["batch_idx", "cls", "bboxes"]:
-            batch[k] = batch[k].to(self.device)
+        for k in ["batch_idx", "cls", "zitai", "mohu", "bboxes"]:
+            if k in batch.keys():
+                batch[k] = batch[k].to(self.device)
 
         if self.args.save_hybrid:
             height, width = batch["img"].shape[2:]
@@ -182,6 +183,8 @@ class DetectionValidator(BaseValidator):
         self.nt_per_class = np.bincount(stats["target_cls"].astype(int), minlength=self.nc)
         self.nt_per_image = np.bincount(stats["target_img"].astype(int), minlength=self.nc)
         stats.pop("target_img", None)
+        stats.pop("target_img_p", None)
+        stats.pop("target_img_zitai", None)
         if len(stats) and stats["tp"].any():
             self.metrics.process(**stats)
         return self.metrics.results_dict

@@ -36,6 +36,7 @@ from .utils import (
     save_dataset_cache_file,
     verify_image,
     verify_image_label,
+    verify_image_label_hy
 )
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for YOLOv8
@@ -60,6 +61,8 @@ class YOLODataset(BaseDataset):
         self.use_keypoints = task == "pose"
         self.use_obb = task == "obb"
         self.data = data
+        self.use_zitai = True
+        self.use_mohu = True
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
         super().__init__(*args, **kwargs)
 
@@ -83,42 +86,84 @@ class YOLODataset(BaseDataset):
                 "'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
                 "keypoints, number of dims (2 for x,y or 3 for x,y,visible)], i.e. 'kpt_shape: [17, 3]'"
             )
-        with ThreadPool(NUM_THREADS) as pool:
-            results = pool.imap(
-                func=verify_image_label,
-                iterable=zip(
-                    self.im_files,
-                    self.label_files,
-                    repeat(self.prefix),
-                    repeat(self.use_keypoints),
-                    repeat(len(self.data["names"])),
-                    repeat(nkpt),
-                    repeat(ndim),
-                ),
-            )
-            pbar = TQDM(results, desc=desc, total=total)
-            for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
-                nm += nm_f
-                nf += nf_f
-                ne += ne_f
-                nc += nc_f
-                if im_file:
-                    x["labels"].append(
-                        {
-                            "im_file": im_file,
-                            "shape": shape,
-                            "cls": lb[:, 0:1],  # n, 1
-                            "bboxes": lb[:, 1:],  # n, 4
-                            "segments": segments,
-                            "keypoints": keypoint,
-                            "normalized": True,
-                            "bbox_format": "xywh",
-                        }
-                    )
-                if msg:
-                    msgs.append(msg)
-                pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
-            pbar.close()
+        if self.use_zitai and self.use_mohu:
+            with ThreadPool(NUM_THREADS) as pool:
+                results = pool.imap(
+                    func=verify_image_label_hy,
+                    iterable=zip(
+                        self.im_files,
+                        self.label_files,
+                        repeat(self.prefix),
+                        repeat(self.use_keypoints),
+                        repeat(self.use_zitai),
+                        repeat(self.use_mohu),
+                        repeat(len(self.data["names"])),
+                        repeat(nkpt),
+                        repeat(ndim),
+                    ),
+                )
+                pbar = TQDM(results, desc=desc, total=total)
+                for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+                    nm += nm_f
+                    nf += nf_f
+                    ne += ne_f
+                    nc += nc_f
+                    if im_file:
+                        x["labels"].append(
+                            {
+                                "im_file": im_file,
+                                "shape": shape,
+                                "cls": lb[:, 0:1],  # n, 1
+                                "zitai": lb[:, 5:6],
+                                "mohu": lb[:, 6:7],
+                                "bboxes": lb[:, 1:5],  # n, 4
+                                "segments": segments,
+                                "keypoints": keypoint,
+                                "normalized": True,
+                                "bbox_format": "xywh",
+                            }
+                        )
+                    if msg:
+                        msgs.append(msg)
+                    pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+                pbar.close()
+        else:
+            with ThreadPool(NUM_THREADS) as pool:
+                results = pool.imap(
+                    func=verify_image_label,
+                    iterable=zip(
+                        self.im_files,
+                        self.label_files,
+                        repeat(self.prefix),
+                        repeat(self.use_keypoints),
+                        repeat(len(self.data["names"])),
+                        repeat(nkpt),
+                        repeat(ndim),
+                    ),
+                )
+                pbar = TQDM(results, desc=desc, total=total)
+                for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+                    nm += nm_f
+                    nf += nf_f
+                    ne += ne_f
+                    nc += nc_f
+                    if im_file:
+                        x["labels"].append(
+                            {
+                                "im_file": im_file,
+                                "shape": shape,
+                                "cls": lb[:, 0:1],  # n, 1
+                                "bboxes": lb[:, 1:],  # n, 4
+                                "segments": segments,
+                                "keypoints": keypoint,
+                                "normalized": True,
+                                "bbox_format": "xywh",
+                            }
+                        )
+                    if msg:
+                        msgs.append(msg)
+                    pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+                pbar.close()
 
         if msgs:
             LOGGER.info("\n".join(msgs))
@@ -236,7 +281,7 @@ class YOLODataset(BaseDataset):
             value = values[i]
             if k == "img":
                 value = torch.stack(value, 0)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb", "zitai", "mohu"}:
                 value = torch.cat(value, 0)
             new_batch[k] = value
         new_batch["batch_idx"] = list(new_batch["batch_idx"])

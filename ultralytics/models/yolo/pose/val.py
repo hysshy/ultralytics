@@ -63,13 +63,13 @@ class PoseValidator(DetectionValidator):
 
     def postprocess(self, preds):
         """Apply non-maximum suppression and return detections with high confidence scores."""
-        return ops.non_max_suppression(
+        return ops.hy_non_max_suppression(
             preds,
             self.args.conf,
             self.args.iou,
             labels=self.lb,
             multi_label=True,
-            agnostic=self.args.single_cls or self.args.agnostic_nms,
+            agnostic=self.args.single_cls,
             max_det=self.args.max_det,
             nc=self.nc,
         )
@@ -81,7 +81,9 @@ class PoseValidator(DetectionValidator):
         is_pose = self.kpt_shape == [17, 3]
         nkpt = self.kpt_shape[0]
         self.sigma = OKS_SIGMA if is_pose else np.ones(nkpt) / nkpt
-        self.stats = dict(tp_p=[], tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])
+        self.stats = dict(tp_zitai=[], conf_zitai=[], pred_cls_zitai=[], target_cls_zitai=[], target_img_zitai=[],
+                          tp_p=[], conf_p=[], pred_cls_p=[], target_cls_p=[], target_img_p=[],
+                          tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])
 
     def _prepare_batch(self, si, batch):
         """Prepares a batch for processing by converting keypoints to float and moving to device."""
@@ -93,33 +95,41 @@ class PoseValidator(DetectionValidator):
         kpts[..., 1] *= h
         kpts = ops.scale_coords(pbatch["imgsz"], kpts, pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"])
         pbatch["kpts"] = kpts
+
+        idx = batch["batch_idx"] == si
+        zitai = batch["zitai"][idx].squeeze(-1)
+        pbatch["zitai"] = zitai
+
         return pbatch
 
-    def _prepare_pred(self, pred, pbatch):
+    def _prepare_pred(self, pred, pbatch, start_kp=6):
         """Prepares and scales keypoints in a batch for pose processing."""
         predn = super()._prepare_pred(pred, pbatch)
         nk = pbatch["kpts"].shape[1]
-        pred_kpts = predn[:, 6:].view(len(predn), nk, -1)
+        pred_kpts = predn[:, start_kp:].view(len(predn), nk, -1)
         ops.scale_coords(pbatch["imgsz"], pred_kpts, pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"])
         return predn, pred_kpts
 
-    def update_metrics(self, preds, batch):
+    def update_metrics(self, preds, batch, mode=''):
         """Metrics."""
+        start_kp = 8
         for si, pred in enumerate(preds):
             self.seen += 1
             npr = len(pred)
-            stat = dict(
-                conf=torch.zeros(0, device=self.device),
-                pred_cls=torch.zeros(0, device=self.device),
-                tp=torch.zeros(npr, self.niou, dtype=torch.bool, device=self.device),
-                tp_p=torch.zeros(npr, self.niou, dtype=torch.bool, device=self.device),
-            )
+            stat = {}
+            # stat = dict(
+            #     conf=torch.zeros(0, device=self.device),
+            #     pred_cls=torch.zeros(0, device=self.device),
+            #     tp=torch.zeros(npr, self.niou, dtype=torch.bool, device=self.device),
+            #     tp_p=torch.zeros(npr, self.niou, dtype=torch.bool, device=self.device),
+            # )
             pbatch = self._prepare_batch(si, batch)
             cls, bbox = pbatch.pop("cls"), pbatch.pop("bbox")
             nl = len(cls)
             stat["target_cls"] = cls
             stat["target_img"] = cls.unique()
             if npr == 0:
+                continue
                 if nl:
                     for k in self.stats.keys():
                         self.stats[k].append(stat[k])
@@ -130,18 +140,51 @@ class PoseValidator(DetectionValidator):
             # Predictions
             if self.args.single_cls:
                 pred[:, 5] = 0
-            predn, pred_kpts = self._prepare_pred(pred, pbatch)
+            predn, pred_kpts = self._prepare_pred(pred, pbatch, start_kp=start_kp)
+            ##########################hy修改#############################
+            if mode in ['hypose', 'hyzitai']:
+                pred_cls = predn[:, 5]
+                face_idx = []
+                for i, c in enumerate(pred_cls):
+                    if c.item() in [0, 1]:
+                        face_idx.append(i)
+                if len(face_idx) == 0:
+                    continue
+                face_idx = torch.tensor(face_idx, device=self.device)
+                predn = predn[face_idx]
+                pred_kpts = pred_kpts[face_idx]
+            ##########################hy修改#############################
             stat["conf"] = predn[:, 4]
             stat["pred_cls"] = predn[:, 5]
+            if mode == 'hypose':
+                stat["conf_p"] = predn[:, 4]
+                stat["pred_cls_p"] = predn[:, 5]
+                stat["target_cls_p"] = cls
+                stat["target_img_p"] = cls.unique()
+            if mode == 'hyzitai':
+                zitai = pbatch.pop("zitai")
+                stat["conf_zitai"] = predn[:, 4]
+                stat["pred_cls_zitai"] = predn[:, 6]
+                stat["target_cls_zitai"] = zitai
+                stat["target_img_zitai"] = zitai.unique()
 
             # Evaluate
             if nl:
-                stat["tp"] = self._process_batch(predn, bbox, cls)
-                stat["tp_p"] = self._process_batch(predn, bbox, cls, pred_kpts, pbatch["kpts"])
-            if self.args.plots:
-                self.confusion_matrix.process_batch(predn, bbox, cls)
+                if mode == 'hyzitai':
+                    stat["tp_zitai"] = self._process_batch(predn, bbox, zitai, idx=6)
+                else:
+                    stat["tp"] = self._process_batch(predn, bbox, cls)
+                    stat["tp_p"] = self._process_batch(predn, bbox, cls, pred_kpts, pbatch["kpts"])
+                if self.args.plots:
+                    self.confusion_matrix.process_batch(predn, bbox, cls)
 
-            for k in self.stats.keys():
+            for k in stat.keys():
+                if mode == 'hydetect' and '_p' in k:
+                    continue
+                if mode == 'hypose' and '_p' not in k:
+                    continue
+                if mode == 'hyzitai' and '_zitai' not in k:
+                    continue
                 self.stats[k].append(stat[k])
 
             # Save
@@ -156,7 +199,7 @@ class PoseValidator(DetectionValidator):
                     self.save_dir / "labels" / f'{Path(batch["im_file"][si]).stem}.txt',
                 )
 
-    def _process_batch(self, detections, gt_bboxes, gt_cls, pred_kpts=None, gt_kpts=None):
+    def _process_batch(self, detections, gt_bboxes, gt_cls, pred_kpts=None, gt_kpts=None, idx=5):
         """
         Return correct prediction matrix by computing Intersection over Union (IoU) between detections and ground truth.
 
@@ -194,7 +237,7 @@ class PoseValidator(DetectionValidator):
         else:  # boxes
             iou = box_iou(gt_bboxes, detections[:, :4])
 
-        return self.match_predictions(detections[:, 5], gt_cls, iou)
+        return self.match_predictions(detections[:, idx], gt_cls, iou)
 
     def plot_val_samples(self, batch, ni):
         """Plots and saves validation set samples with predicted bounding boxes and keypoints."""

@@ -102,6 +102,7 @@ class BaseValidator:
 
         self.plots = {}
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
+        self.hypose = True
 
     @smart_inference_mode()
     def __call__(self, trainer=None, model=None):
@@ -187,11 +188,107 @@ class BaseValidator:
             # Postprocess
             with dt[3]:
                 preds = self.postprocess(preds)
+                if self.hypose:
+                    ###############################hy修改############################
+                    im_files = batch["im_file"]
+                    kp_index = []
+                    kp_batch_idx = []
+                    kp_index2 = []
+                    detect_index = []
+                    detect_batch_idx = []
+                    detect_index2 = []
+                    zitai_index = []
+                    zitai_batch_idx = []
+                    zitai_index2 = []
+                    for i, im_file in enumerate(im_files):
+                        subname = im_file.split("/")[-2]
+                        if subname == "detect":
+                            detect_index.append(i)
+                            for j in range(len(batch["batch_idx"])):
+                                if batch["batch_idx"][j].item() == i:
+                                    detect_index2.append(j)
+                                    detect_batch_idx.append(detect_index.index(i))
+                        elif subname == "facekp":
+                            kp_index.append(i)
+                            for j in range(len(batch["batch_idx"])):
+                                if batch["batch_idx"][j].item() == i:
+                                    kp_batch_idx.append(kp_index.index(i))
+                                    kp_index2.append(j)
+                        elif subname == "faceZitai":
+                            zitai_index.append(i)
+                            for j in range(len(batch["batch_idx"])):
+                                if batch["batch_idx"][j].item() == i:
+                                    zitai_index2.append(j)
+                                    zitai_batch_idx.append(zitai_index.index(i))
 
-            self.update_metrics(preds, batch)
-            if self.args.plots and batch_i < 3:
-                self.plot_val_samples(batch, batch_i)
-                self.plot_predictions(batch, preds, batch_i)
+                    kp_index = torch.tensor(kp_index, device=self.device)
+                    kp_index2 = torch.tensor(kp_index2)
+                    detect_index = torch.tensor(detect_index, device=self.device)
+                    detect_index2 = torch.tensor(detect_index2)
+                    zitai_index = torch.tensor(zitai_index, device=self.device)
+                    zitai_index2 = torch.tensor(zitai_index2)
+                    if len(detect_index) > 0:
+                        detect_batch = {}
+                        for k, v in batch.items():
+                            if k in ["ori_shape", "im_file", "resized_shape", "ratio_pad"]:
+                                vlist = []
+                                for j in detect_index:
+                                    vlist.append(v[j.item()])
+                                detect_batch[k] = vlist
+                            elif k == "img":
+                                detect_batch[k] = v[detect_index]
+                            elif k == "batch_idx":
+                                detect_batch[k] = torch.tensor(detect_batch_idx, device=self.device)
+                            else:
+                                detect_batch[k] = v[detect_index2]
+                        detect_preds = []
+                        for j in detect_index:
+                            detect_preds.append(preds[j.item()])
+                        self.update_metrics(detect_preds, detect_batch, mode="hydetect")
+
+                    if len(kp_index) > 0:
+                        kp_batch = {}
+                        for k, v in batch.items():
+                            if k in ["ori_shape", "im_file", "resized_shape", "ratio_pad"]:
+                                vlist = []
+                                for j in kp_index:
+                                    vlist.append(v[j.item()])
+                                kp_batch[k] = vlist
+                            elif k == "img":
+                                kp_batch[k] = v[kp_index]
+                            elif k == "batch_idx":
+                                kp_batch[k] = torch.tensor(kp_batch_idx, device=self.device)
+                            else:
+                                kp_batch[k] = v[kp_index2]
+                        kp_preds = []
+                        for j in kp_index:
+                            kp_preds.append(preds[j.item()])
+                        self.update_metrics(kp_preds, kp_batch, mode="hypose")
+
+                    if len(zitai_index) > 0:
+                        zitai_batch = {}
+                        for k, v in batch.items():
+                            if k in ["ori_shape", "im_file", "resized_shape", "ratio_pad"]:
+                                vlist = []
+                                for j in zitai_index:
+                                    vlist.append(v[j.item()])
+                                zitai_batch[k] = vlist
+                            elif k == "img":
+                                zitai_batch[k] = v[zitai_index]
+                            elif k == "batch_idx":
+                                zitai_batch[k] = torch.tensor(zitai_batch_idx, device=self.device)
+                            else:
+                                zitai_batch[k] = v[zitai_index2]
+                        zitai_preds = []
+                        for j in zitai_index:
+                            zitai_preds.append(preds[j.item()])
+                        self.update_metrics(zitai_preds, zitai_batch, mode="hyzitai")
+                    ###############################hy修改##########
+            if not self.hypose:
+                self.update_metrics(preds, batch)
+            # if self.args.plots and batch_i < 3:
+            #     self.plot_val_samples(batch, batch_i)
+            #     self.plot_predictions(batch, preds, batch_i)
 
             self.run_callbacks("on_val_batch_end")
         stats = self.get_stats()
