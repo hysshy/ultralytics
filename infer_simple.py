@@ -1,26 +1,18 @@
-from PIL import ImageFile
 import cv2
 import os
 import time
-import torch
-from torch.xpu import device
 
 savepath = '/home/chase/shy/dataset/test'  # 姿态保存路径
-imgpath = '/home/chase/shy/dataset/detect_zitai/val/images/detect'  # 待预测图片路径
+imgpath = '/home/chase/shy/dataset/spjgh/val/images/detect'  # 待预测图片路径
 from ultralytics import YOLO
-import yaml
 # Load a model
-# model = YOLO("/home/chase/shy/dataset/detect_mohu/yolov8-pose.yaml")
-# model = YOLO('/home/chase/shy/dataset/detect_mohu/run2/train14/weights/best.pt') # 加载部分训练的模型
-model = YOLO('/home/chase/shy/dataset/detect_mohu/run2/train18/weights/best.onnx', task='pose') # 加载部分训练的模型
-# device = torch.device('cuda:0')
-# model.predictor.device = device
+model = YOLO('/home/chase/shy/dataset/spjgh/yolov11/modeln/best.pt', task='pose') # 加载部分训练的模型
+
 for imgName in os.listdir(imgpath):
     img = cv2.imread(imgpath + '/' + imgName)
     start = time.time()
-    result = model(img, device='cuda:0')  # 预测图片
+    result = model(img, device='cuda:0', conf=0.35)  # 预测图片
     print(time.time() - start)
-    # result = model('/home/chase/shy/dataset/detect_zitai/val/images/detect/jiaoyan1_44599.825625_1370649456974999552.jpg')
     bboxes = result[0].boxes.xyxy.cpu().numpy()  # 预测框
     cls = result[0].boxes.cls.cpu().numpy()  # 预测类别
     names = result[0].names  # 类别名称
@@ -50,9 +42,3 @@ for imgName in os.listdir(imgpath):
         cv2.rectangle(img, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2) # 画框
         cv2.putText(img, label, (bbox[0], bbox[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2) # 写标签
     cv2.imwrite(savepath +'/'+ imgName, img) # 保存图片
-    #result[0].show()  # 显示预测结果
-    # while True:
-    #     start = time.time()
-    #     result = model('/home/chase/shy/dataset/detect_kp/val/images/detect/1592259996533.jpg')  # 预测图片
-    #     print(time.time() - start)
-    # result[0].show()  # 显示预测结果
